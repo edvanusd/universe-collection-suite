@@ -275,6 +275,8 @@ body{background:radial-gradient(62vmax 52vmax at 6% -4%,var(--blob-a),transparen
 <div id="toast" role="status" hidden></div>
 <div id="splash" hidden><div class="s3d" id="splash3d"></div><b id="splashName"></b><span>Universe Solusi Digital</span></div>
 
+<script src="config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
 (function(){
@@ -309,12 +311,18 @@ const S={route:'portal',mode:'loading',db:null,slow:false,
   data:{accounts:[],activities:[],ptp:[],ttr:[],rmp:[],skip:[],meta:[]},loaded:{},
   fc:{tab:'home',screen:null,acc:null,who:null,checkin:null,q:''},
   dc:{tab:'dash',acc:null,who:null,queue:'work',bucket:'',q:'',aq:'',edit:null,sedit:null},
-  vals:{},error:''};
+  vals:{},error:'',me:null,sbReady:false,sbLoaded:false};
 const COLLS=Object.keys(S.data);
-const DEMO_PW='demo123'; // prototype gate only; a real build authenticates on the server
+const DEMO_PW='demo123'; // demo mode only; with Supabase the password is checked by Supabase Auth
+const CFG=window.UCS_CONFIG||{};
+const SB=()=>S.mode==='sb';
+let sb=null;
 try{const w=JSON.parse(localStorage.getItem('ucs-session')||'{}');if(w.fc)S.fc.who=w.fc;if(w.dc)S.dc.who=w.dc}catch(e){}
-const saveWho=()=>{try{localStorage.setItem('ucs-session',JSON.stringify({fc:S.fc.who,dc:S.dc.who}))}catch(e){}};
-const authed=()=>{const fc=S.route==='front-coll',w=fc?S.fc.who:S.dc.who;return !!w&&(meta().staff||[]).some(s=>s.id===w&&(fc?s.role==='FC':s.role!=='FC'))};
+const saveWho=()=>{if(SB())return;try{localStorage.setItem('ucs-session',JSON.stringify({fc:S.fc.who,dc:S.dc.who}))}catch(e){}};
+const authed=()=>{const fc=S.route==='front-coll';
+  if(SB()) return !!S.me&&(fc?S.me.role==='FC':S.me.role!=='FC');
+  const w=fc?S.fc.who:S.dc.who;return !!w&&(meta().staff||[]).some(s=>s.id===w&&(fc?s.role==='FC':s.role!=='FC'))};
+const isAdmin=()=>staff(S.dc.who).role==='ADMIN';
 
 const meta=()=>S.data.meta.find(m=>m.id==='config')||{};
 const P=()=>meta().process_date||localISO(new Date());
@@ -345,9 +353,52 @@ function trackMap(){
   return '<svg class="map" viewBox="0 0 '+W+' '+H+'" role="img" aria-label="Posisi terakhir petugas lapangan">'+G.map(g=>'<circle cx="'+X(g).toFixed(1)+'" cy="'+Y(g).toFixed(1)+'" r="3" style="fill:var(--ink-2);opacity:.45"/>').join('')+fcs+'</svg>';
 }
 
-/* ---------- data layer: shared store when available, sample file otherwise ---------- */
+/* ---------- Supabase backend: read tables, write through ucs_* RPCs, live updates over Realtime ---------- */
+const TBL={accounts:['ucs_accounts','contract_no',{}],activities:['ucs_activities','id',{actor:'by',occurred_at:'at'}],
+  ptp:['ucs_ptp','id',{actor:'by',promise_date:'date'}],ttr:['ucs_ttr','ttr_no',{}],rmp:['ucs_rmp','id',{actor:'by'}],
+  skip:['ucs_skip_cases','id',{actor:'by',trigger_source:'trigger'}]};
+function mapRow(row,key,ren){const o={};for(const f in row){if(row[f]!==null)o[ren[f]||f]=row[f]}o.id=row[key];return o}
+async function sbLoad(){
+  const keys=Object.keys(TBL),q=keys.map(c=>sb.from(TBL[c][0]).select('*').limit(5000));
+  q.push(sb.from('ucs_app_config').select('*').eq('id',1).maybeSingle());
+  q.push(sb.from('ucs_staff').select('id,name,role,scope').eq('active',true).order('id'));
+  const r=await Promise.all(q),bad=r.find(x=>x.error);if(bad)throw bad.error;
+  keys.forEach((c,i)=>{S.data[c]=(r[i].data||[]).map(row=>mapRow(row,TBL[c][1],TBL[c][2]))});
+  const cfg=r[keys.length].data||{};
+  S.data.meta=[{id:'config',branch:cfg.branch,process_date:cfg.process_date,staff:r[keys.length+1].data||[]}];
+  S.sbLoaded=true;
+}
+let chan=null,reloadT=null;
+function sbSubscribe(){
+  if(chan)return;chan=sb.channel('ucs-live');
+  ['ucs_accounts','ucs_activities','ucs_ptp','ucs_ttr','ucs_rmp','ucs_skip_cases','ucs_staff','ucs_app_config'].forEach(t=>
+    chan.on('postgres_changes',{event:'*',schema:'public',table:t},()=>{clearTimeout(reloadT);reloadT=setTimeout(()=>{sbLoad().then(scheduleRender).catch(()=>{})},400)}));
+  chan.subscribe();
+}
+function sbClear(){
+  S.me=null;S.fc.who=null;S.dc.who=null;S.sbLoaded=false;
+  COLLS.forEach(c=>{S.data[c]=[]});
+  if(chan){sb.removeChannel(chan);chan=null}
+}
+async function sbAfterSignIn(){
+  const {data,error}=await sb.rpc('ucs_whoami');
+  if(error||!data){await sb.auth.signOut();sbClear();return false}
+  S.me=data;S.fc.who=data.role==='FC'?data.id:null;S.dc.who=data.role!=='FC'?data.id:null;
+  try{await sbLoad()}catch(e){S.error=e.message||'tidak bisa memuat data'}
+  sbSubscribe();return true;
+}
+async function call(name,args){const {data,error}=await sb.rpc(name,args||{});if(error)throw error;return data}
+
+/* ---------- data layer: Supabase when configured, Claude shared store, or the sample file ---------- */
 async function boot(){
   render();
+  if(CFG.supabaseUrl&&CFG.supabaseAnonKey&&window.supabase){
+    S.mode='sb';
+    sb=window.supabase.createClient(CFG.supabaseUrl,CFG.supabaseAnonKey,{auth:{persistSession:true,autoRefreshToken:true}});
+    sb.auth.onAuthStateChange(ev=>{if(ev==='SIGNED_OUT'&&S.me){sbClear();render()}});
+    try{const {data}=await sb.auth.getSession();if(data&&data.session)await sbAfterSignIn()}catch(e){}
+    S.sbReady=true;render();return;
+  }
   let db=null;
   try{ if(window.claude&&window.claude.use) db=await window.claude.use('db') }catch(e){}
   if(db){
@@ -384,8 +435,8 @@ async function put(coll,id,data,merge){
 let busy=false;
 async function save(fn,okMsg){
   if(busy)return false;busy=true;
-  try{await fn();toast(okMsg);return true}
-  catch(e){toast(e&&e.code==='invalid_argument'?'Tidak tersimpan: akun Anda hanya punya akses baca.':'Tidak tersimpan. Periksa koneksi lalu coba lagi.');return false}
+  try{await fn();if(SB()){try{await sbLoad()}catch(x){}}toast(okMsg);return true}
+  catch(e){toast(SB()&&e&&e.message?'Tidak tersimpan: '+e.message:e&&e.code==='invalid_argument'?'Tidak tersimpan: akun Anda hanya punya akses baca.':'Tidak tersimpan. Periksa koneksi lalu coba lagi.');return false}
   finally{busy=false;render()}
 }
 
@@ -405,14 +456,15 @@ function render(){
   keep();pending=false;
   const r=S.route;
   $('#nav').innerHTML=[['portal','Portal'],['front-coll','Front Coll'],['desk-call','Desk Call']].map(x=>'<a href="#'+x[0]+'"'+(r===x[0]?' aria-current="page"':'')+'>'+x[1]+'</a>').join('');
-  $('#modechip').innerHTML=S.mode==='live'?'<b>Data contoh</b> · tersimpan bersama':S.mode==='demo'?'<b>Mode demo</b> · perubahan tidak tersimpan':S.mode==='empty'?'Data tidak tersedia':'Memuat data…';
+  $('#modechip').innerHTML=SB()?(S.me?'<b>Supabase</b> · tersimpan di server':'<b>Supabase</b> · belum masuk'):S.mode==='live'?'<b>Data contoh</b> · tersimpan bersama':S.mode==='demo'?'<b>Mode demo</b> · perubahan tidak tersimpan':S.mode==='empty'?'Data tidak tersedia':'Memuat data…';
   const view=$('#view');
   view.className='wrap'+(r==='front-coll'?' fc':'');
-  const ready=S.mode==='demo'||(S.mode==='live'&&S.loaded.accounts&&S.loaded.meta);
+  const ready=S.mode==='demo'||(S.mode==='live'&&S.loaded.accounts&&S.loaded.meta)||(SB()&&S.sbReady);
   let html;
   if(r==='portal') html=portal(ready);
-  else if(!ready||!S.data.accounts.length) html=emptyState();
+  else if(!ready||(!SB()&&!S.data.accounts.length)) html=emptyState();
   else if(!authed()) html=login();
+  else if(SB()&&!S.sbLoaded) html=emptyState();
   else html=r==='front-coll'?frontColl():deskCall();
   const w=r==='front-coll'?S.fc.who:r==='desk-call'?S.dc.who:null;
   $('#userbox').innerHTML=r!=='portal'&&ready&&authed()?'<b>'+esc(staff(w).name)+'</b><button class="btn sm" data-act="logout">Keluar</button>':'';
@@ -420,7 +472,7 @@ function render(){
   mount3D();
 }
 function emptyState(){
-  const msg=S.error?'Data tidak bisa dimuat ('+esc(S.error)+').':S.mode==='loading'||(S.mode==='live'&&!S.loaded.accounts)?(S.slow?'Data belum bisa dijangkau. Halaman akan terisi begitu tersambung.':'Memuat daftar account…'):'Belum ada account. Daftar account, janji bayar dan aktivitas akan tampil di sini setelah data dimuat.';
+  const msg=S.error?'Data tidak bisa dimuat ('+esc(S.error)+').':SB()?'Menghubungkan ke server…':S.mode==='loading'||(S.mode==='live'&&!S.loaded.accounts)?(S.slow?'Data belum bisa dijangkau. Halaman akan terisi begitu tersambung.':'Memuat daftar account…'):'Belum ada account. Daftar account, janji bayar dan aktivitas akan tampil di sini setelah data dimuat.';
   return '<div class="empty"><h2>Collection System</h2><p>'+msg+'</p></div>';
 }
 
@@ -432,8 +484,9 @@ function login(){
     <div class="field"><label for="l_id">ID petugas</label><input id="l_id" data-k="l_id" autocomplete="username" autocapitalize="characters" value="${esc(v('l_id'))}" placeholder="${fc?'FC01':'TC01'}"></div>
     <div class="field"><label for="l_pw">Kata sandi</label><input id="l_pw" data-k="l_pw" type="password" autocomplete="current-password" value="${esc(v('l_pw'))}"></div>
     <div class="err" id="formErr" hidden></div>
-    <button class="btn primary block" type="submit">Masuk</button>
-    <p class="note" style="margin:0">Akun contoh: <b>${esc(ids)}</b>, kata sandi <b class="mono">${DEMO_PW}</b>. Login prototipe ini belum memakai autentikasi server.</p>
+    <button class="btn primary block" type="submit" id="l_btn">Masuk</button>
+    ${SB()?'<p class="note" style="margin:0">Masuk dengan ID petugas dan kata sandi dari admin. Satu browser memakai satu sesi: masuk ke aplikasi lain akan mengakhiri sesi yang sedang aktif.</p>'
+      :'<p class="note" style="margin:0">Mode demo. Akun contoh: <b>'+esc(ids)+'</b>, kata sandi <b class="mono">'+DEMO_PW+'</b>.</p>'}
   </form></div>`;
   return fc?'<div class="fc-stage"><div class="phone"><div class="fc-body">'+card+'</div></div></div>':card;
 }
@@ -445,7 +498,7 @@ function portal(ready){
     <div><div class="eyebrow">Universe Solusi Digital · prototipe</div>
       <h1>Penagihan dari <em>meja telepon</em> sampai <em>pintu debitur</em>, satu data.</h1>
       <p>Dua aplikasi dari PRD Collection System. Hasil call di Desk Call langsung terbaca petugas lapangan, dan hasil kunjungan Front Coll langsung masuk ke layar desk.</p>
-      <div class="facts">${ready?`<div><b class="num">${A.length}</b><span class="muted">account contoh</span></div><div><b class="num">${rp(os)}</b><span class="muted">total tunggakan</span></div><div><b>${fmtD(P())}</b><span class="muted">posisi data (batch H+1)</span></div>`:'<span class="muted">'+(S.mode==='empty'?'Data contoh tidak tersedia.':'Memuat data…')+'</span>'}</div>
+      <div class="facts">${SB()&&!S.sbLoaded?'<span class="muted">'+(ready?'Masuk ke Front Coll atau Desk Call untuk melihat ringkasan data.':'Menghubungkan ke server…')+'</span>':ready?`<div><b class="num">${A.length}</b><span class="muted">account aktif</span></div><div><b class="num">${rp(os)}</b><span class="muted">total tunggakan</span></div><div><b>${fmtD(P())}</b><span class="muted">posisi data (batch H+1)</span></div>`:'<span class="muted">'+(S.mode==='empty'?'Data contoh tidak tersedia.':'Memuat data…')+'</span>'}</div>
     </div>
     <div class="hero-3d" data-3d="mark"></div>
   </section>
@@ -457,11 +510,11 @@ function portal(ready){
       <ul><li>Worklist call berdasarkan bucket, segmen dan janji bayar</li><li>Pencatatan hasil call, PTP dan eskalasi ke lapangan</li><li>Skip tracing, surat peringatan SP 1–3</li><li>Dashboard dan pantauan aktivitas lapangan</li></ul>
       <span class="go">Buka Desk Call →</span></a>
   </section>
-  <p class="note" style="margin-top:16px">Seluruh nama, nomor telepon dan kontrak adalah data contoh. Lokasi GPS, kamera dan sambungan telepon tidak aktif di prototipe web ini.</p>`;
+  <p class="note" style="margin-top:16px">Seluruh nama, nomor telepon dan kontrak adalah data contoh. Lokasi check-in memakai GPS dummy; kamera dan sambungan telepon belum aktif.${SB()?' Data tersimpan di Supabase dan langsung terlihat di kedua aplikasi.':' Mode demo: perubahan hanya ada di browser ini.'}</p>`;
 }
 
 /* ---------- Front Coll ---------- */
-const akh=()=>S.data.accounts.filter(a=>a.collector_id===S.fc.who||(a.escalated&&S.fc.who==='FC01'&&!a.collector_id));
+const akh=()=>S.data.accounts.filter(a=>a.collector_id===S.fc.who);
 const visitToday=a=>S.data.activities.find(x=>x.contract_no===a.id&&x.type==='VISIT'&&x.work_date===P()&&x.by===S.fc.who);
 const myTTR=()=>S.data.ttr.filter(t=>t.issued_to===S.fc.who&&t.status!=='VOID');
 const SUB={search:'Cari account',myptp:'Janji bayar saya',myrmp:'Pengajuan RMP saya'};
@@ -645,8 +698,9 @@ const spDue=a=>a.dpd>=21?3:a.dpd>=14?2:a.dpd>=7?1:0;
 function deskCall(){
   const d=S.dc,me=staff(d.who);
   const openSkip=S.data.skip.filter(s=>s.status==='OPEN').length,spN=S.data.accounts.filter(a=>a.sp_level<spDue(a)).length;
-  const nav=[[null,'Operasional'],['dash','Dashboard',''],['work','Worklist',S.data.accounts.filter(a=>inQueue(a)&&!callToday(a)).length],['ptp','Janji bayar',S.data.ptp.filter(p=>p.status==='ACTIVE').length],['skip','Skip tracing',openSkip],['sp','Surat peringatan',spN],['field','Lapangan & RMP',S.data.rmp.filter(r=>r.status==='DIAJUKAN').length],
-    [null,'Data & pengaturan'],['accs','Data account',''],['assign','Penugasan',S.data.accounts.filter(a=>(a.dpd>=8||a.escalated)&&!a.collector_id).length],['ttr','Stok TTR',''],['staff','Petugas','']];
+  const nav=[[null,'Operasional'],['dash','Dashboard',''],['work','Worklist',S.data.accounts.filter(a=>inQueue(a)&&!callToday(a)).length],['ptp','Janji bayar',S.data.ptp.filter(p=>p.status==='ACTIVE').length],['skip','Skip tracing',openSkip],['sp','Surat peringatan',spN],['field','Lapangan & RMP',S.data.rmp.filter(r=>r.status==='DIAJUKAN').length]]
+    .concat(isAdmin()?[[null,'Data & pengaturan'],['accs','Data account',''],['assign','Penugasan',S.data.accounts.filter(a=>(a.dpd>=8||a.escalated)&&!a.collector_id).length],['ttr','Stok TTR',''],['staff','Petugas','']]:[]);
+  if(!isAdmin()&&['accs','assign','ttr','staff'].includes(d.tab)){d.tab='dash';d.edit=null}
   const a=d.acc&&acc(d.acc);
   const body=a?dcDetail(a):d.tab==='work'?dcWork():d.tab==='ptp'?dcPtp():d.tab==='skip'?dcSkip():d.tab==='sp'?dcSp():d.tab==='field'?dcField():d.tab==='accs'?dcAccounts():d.tab==='assign'?dcAssign():d.tab==='ttr'?dcTtr():d.tab==='staff'?dcStaff():dcDash();
   const tcs=(meta().staff||[]).filter(s=>s.role==='TELE'),m={};tcs.forEach(s=>{m[s.id]=s.name});
@@ -667,7 +721,7 @@ function dcDash(){
   const dt=new Date(P()+'T00:00:00'),DAY=['Minggu','Senin','Selasa','Rabu','Kamis','Jumat','Sabtu'],C=2*Math.PI*46;
   const vToday=acts.filter(x=>x.type==='VISIT'&&x.work_date===P()),paid=vToday.reduce((s,x)=>s+(x.amount||0),0);
   const hero=`<div class="dhead"><div><h1 class="greet">${greet}, ${esc(String(me.name).split(' ')[0])}</h1><div class="muted">${DAY[dt.getDay()]}, ${fmtD(P())} · ${q.length-called.length} account menunggu ditelepon</div></div>
-      <div class="formactions"><button class="btn pill" data-act="dc-tab" data-tab="field">Aktivitas lapangan</button><button class="btn pill dark" data-act="acc-edit" data-id="new">+ Tambah account</button></div></div>
+      <div class="formactions"><button class="btn pill" data-act="dc-tab" data-tab="field">Aktivitas lapangan</button>${isAdmin()?'<button class="btn pill dark" data-act="acc-edit" data-id="new">+ Tambah account</button>':''}</div></div>
     <div class="gdash">
       <section class="ghero"><span class="gtag">Desk Call · ${esc(meta().branch||'')}</span>
         <div class="ghero-in"><div class="ghero-txt"><h2>${called.length} dari ${q.length} account antrean sudah dihubungi</h2>
@@ -725,7 +779,7 @@ function dcDetail(a){
   if(r==='REFUSE') cond='<div class="note">Account dieskalasi ke kunjungan lapangan dan muncul di AKH Front Coll.</div>';
   if(r==='RMP') cond=`<div class="field"><label for="r_type">Jenis program yang diminta</label><select id="r_type" data-k="r_type">${opts('r_type',RMP_TYPES,'TENOR_EXT')}</select></div>`;
   if(r==='PAID') cond='<div class="note">Catat tanggal, nominal dan kanal bayar yang disebut debitur di kolom catatan untuk verifikasi.</div>';
-  return `<div class="dhead"><div><button class="btn sm" data-act="dc-close">← Kembali ke daftar</button> <button class="btn sm" data-act="acc-edit" data-id="${esc(a.id)}">Ubah data</button><h1 style="margin-top:8px">${esc(a.name)}</h1><div class="muted"><span class="mono">${esc(a.id)}</span> · ${esc(a.unit)} · <span class="mono">${esc(a.plate)}</span></div></div>
+  return `<div class="dhead"><div><button class="btn sm" data-act="dc-close">← Kembali ke daftar</button>${isAdmin()?' <button class="btn sm" data-act="acc-edit" data-id="'+esc(a.id)+'">Ubah data</button>':''}<h1 style="margin-top:8px">${esc(a.name)}</h1><div class="muted"><span class="mono">${esc(a.id)}</span> · ${esc(a.unit)} · <span class="mono">${esc(a.plate)}</span></div></div>
       <div style="display:flex;gap:6px;flex-wrap:wrap"><span class="chip ${bCls(a.bucket)}">${bLabel(a.bucket)} · ${a.dpd?'DPD '+a.dpd:'H-'+a.days_to_due}</span><span class="chip">${SEG[a.segment]}</span><span class="chip">MOB ${a.mob}</span><span class="chip">SP ${a.sp_level}</span>${a.escalated?'<span class="chip crit">Dieskalasi ke lapangan</span>':''}</div></div>
     <div class="detail"><div style="display:flex;flex-direction:column;gap:14px;min-width:0">
         ${dueBlock(a)}
@@ -773,7 +827,7 @@ function dcField(){
   return `<div class="dhead"><div><div class="eyebrow">Dari Front Coll</div><h1>Aktivitas lapangan dan RMP</h1></div></div>
     <div class="panel"><h2>Posisi terakhir petugas <span class="chip">GPS dummy</span></h2>${trackMap()}<p class="muted" style="margin:8px 0 0">Titik abu-abu adalah alamat debitur, titik berwarna adalah check-in terakhir tiap petugas.</p></div>
     <div class="cols"><div class="panel"><h2>Kunjungan terbaru</h2><ul class="timeline">${V.map(x=>{const a=acc(x.contract_no);return '<li><span class="dot"></span><div><div class="t-head">'+esc(a?a.name:x.contract_no)+' · '+esc(VISIT_RES[x.result]||x.result)+'</div><div class="t-meta">'+fmtDT(x.at)+' · '+esc(staff(x.by).name)+(x.amount?' · '+rp(x.amount):'')+(x.ptp_date?' · janji '+fmtD(x.ptp_date):'')+(x.distance_m!=null?' · '+x.distance_m+' m dari alamat':'')+'</div>'+(x.notes?'<div>'+esc(x.notes)+'</div>':'')+'</div></li>'}).join('')}</ul></div>
-      <div class="panel"><h2>Pengajuan RMP</h2>${S.data.rmp.length?S.data.rmp.slice().sort((a,b)=>String(b.created_at).localeCompare(String(a.created_at))).map(r=>{const a=acc(r.contract_no);return '<div class="case" style="margin-bottom:8px"><div><b>'+esc(a?a.name:r.contract_no)+'</b> <span class="chip info">'+esc(RMP_TYPES[r.type]||r.type)+'</span> <span class="chip">'+esc(r.status)+'</span></div><div class="muted">'+fmtD(r.created_at)+' · '+esc(staff(r.by).name)+' · '+(r.channel==='MOBILE'?'Front Coll':'Desk Call')+'</div><div>'+esc(r.reason)+'</div>'+(r.status==='DIAJUKAN'?'<div class="formactions"><button class="btn sm teal" data-act="rmp-set" data-id="'+esc(r.id)+'" data-s="DISETUJUI">Setujui</button><button class="btn sm" data-act="rmp-set" data-id="'+esc(r.id)+'" data-s="DITOLAK">Tolak</button></div>':'')+'</div>'}).join(''):'<p class="muted">Belum ada pengajuan RMP.</p>'}</div></div>`;
+      <div class="panel"><h2>Pengajuan RMP</h2>${S.data.rmp.length?S.data.rmp.slice().sort((a,b)=>String(b.created_at).localeCompare(String(a.created_at))).map(r=>{const a=acc(r.contract_no);return '<div class="case" style="margin-bottom:8px"><div><b>'+esc(a?a.name:r.contract_no)+'</b> <span class="chip info">'+esc(RMP_TYPES[r.type]||r.type)+'</span> <span class="chip">'+esc(r.status)+'</span></div><div class="muted">'+fmtD(r.created_at)+' · '+esc(staff(r.by).name)+' · '+(r.channel==='MOBILE'?'Front Coll':'Desk Call')+'</div><div>'+esc(r.reason)+'</div>'+(r.status==='DIAJUKAN'&&isAdmin()?'<div class="formactions"><button class="btn sm teal" data-act="rmp-set" data-id="'+esc(r.id)+'" data-s="DISETUJUI">Setujui</button><button class="btn sm" data-act="rmp-set" data-id="'+esc(r.id)+'" data-s="DITOLAK">Tolak</button></div>':'')+'</div>'}).join(''):'<p class="muted">Belum ada pengajuan RMP.</p>'}</div></div>`;
 }
 
 /* ---------- Desk Call: data & settings menus ---------- */
@@ -781,6 +835,7 @@ function dcAccounts(){
   const d=S.dc;if(d.edit) return dcAccForm(d.edit==='new'?null:acc(d.edit));
   const q=String(d.aq||'').toLowerCase(),L=S.data.accounts.filter(a=>!q||(a.name+' '+a.id+' '+a.plate).toLowerCase().includes(q)).sort((x,y)=>String(x.name).localeCompare(String(y.name)));
   return `<div class="dhead"><div><div class="eyebrow">Data</div><h1>Data account <span class="muted num">(${L.length})</span></h1></div><button class="btn primary" data-act="acc-edit" data-id="new">+ Tambah account</button></div>
+    <div class="note" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:space-between"><span>Posisi data <b>${fmtD(P())}</b>. Batch harian menghitung ulang DPD, bucket dan tunggakan semua account, lalu menandai janji bayar yang lewat sebagai ingkar.</span><button class="btn sm" data-act="run-batch">Jalankan batch ${fmtD(localISO(new Date()))}</button></div>
     <div class="filters"><div class="field"><label for="a_q">Cari nama, kontrak, nopol</label><input id="a_q" data-input="dc.aq" value="${esc(d.aq)}"></div></div>
     <div class="panel tablewrap">${L.length?`<table><thead><tr><th>Debitur</th><th>Unit</th><th>Angsuran</th><th>Jatuh tempo tertua</th><th>Bucket</th><th>Petugas</th><th></th></tr></thead><tbody>${L.map(a=>'<tr><td><b>'+esc(a.name)+'</b><div class="sub mono">'+esc(a.id)+'</div></td><td>'+esc(a.unit)+'<div class="sub mono">'+esc(a.plate)+'</div></td><td class="num">'+rp(a.installment)+'<div class="sub">ke-'+esc(a.inst_no)+' dari '+esc(a.tenor)+'</div></td><td>'+fmtD(a.oldest_due)+'</td><td><span class="chip '+bCls(a.bucket)+'">'+bLabel(a.bucket)+'</span><div class="sub num">DPD '+a.dpd+'</div></td><td>'+(a.collector_id?esc(staff(a.collector_id).name):'<span class="muted">Desk call</span>')+'</td><td><button class="btn sm" data-act="acc-edit" data-id="'+esc(a.id)+'">Ubah</button></td></tr>').join('')}</tbody></table>`:'<div class="empty">Tidak ada account yang cocok.</div>'}</div>`;
 }
@@ -824,15 +879,16 @@ function dcTtr(){
 function dcStaff(){
   const L=meta().staff||[],e=S.dc.sedit,o=e?L.find(s=>s.id===e)||{}:{},ROLE={FC:'Field collector',TELE:'Telecollector',ADMIN:'Admin collection'};
   return `<div class="dhead"><div><div class="eyebrow">Pengaturan</div><h1>Petugas</h1></div></div>
-    <div class="panel tablewrap"><table><thead><tr><th>ID</th><th>Nama</th><th>Peran</th><th>Cakupan</th><th></th></tr></thead><tbody>${L.map(s=>'<tr><td class="mono">'+esc(s.id)+'</td><td><b>'+esc(s.name)+'</b></td><td>'+esc(ROLE[s.role]||s.role)+'</td><td>'+esc(s.scope)+'</td><td><button class="btn sm" data-act="staff-edit" data-id="'+esc(s.id)+'">Ubah</button> '+(s.id===S.dc.who?'':'<button class="btn sm" data-act="staff-del" data-id="'+esc(s.id)+'">Hapus</button>')+'</td></tr>').join('')}</tbody></table></div>
+    <div class="panel tablewrap"><table><thead><tr><th>ID</th><th>Nama</th><th>Peran</th><th>Cakupan</th><th></th></tr></thead><tbody>${L.map(s=>'<tr><td class="mono">'+esc(s.id)+'</td><td><b>'+esc(s.name)+'</b></td><td>'+esc(ROLE[s.role]||s.role)+'</td><td>'+esc(s.scope)+'</td><td><button class="btn sm" data-act="staff-edit" data-id="'+esc(s.id)+'">Ubah</button> '+(s.id===S.dc.who?'':'<button class="btn sm" data-act="staff-del" data-id="'+esc(s.id)+'">'+(SB()?'Nonaktifkan':'Hapus')+'</button>')+'</td></tr>').join('')}</tbody></table></div>
     <form class="panel" data-form="staff"><h2>${e?'Ubah petugas '+esc(e):'Tambah petugas'}</h2><div class="formgrid">
       <div class="field"><label for="s_id">ID petugas</label><input id="s_id" data-k="s_id" value="${esc(v('s_id',o.id||''))}" ${e?'readonly':''} placeholder="mis. FC04" autocapitalize="characters"></div>
       <div class="field"><label for="s_name">Nama</label><input id="s_name" data-k="s_name" value="${esc(v('s_name',o.name||''))}"></div>
       <div class="field"><label for="s_role">Peran</label><select id="s_role" data-k="s_role">${opts('s_role',ROLE,o.role||'FC')}</select></div>
-      <div class="field"><label for="s_scope">Cakupan</label><input id="s_scope" data-k="s_scope" value="${esc(v('s_scope',o.scope||''))}" placeholder="mis. Bucket 1 · Bekasi Barat"></div></div>
+      <div class="field"><label for="s_scope">Cakupan</label><input id="s_scope" data-k="s_scope" value="${esc(v('s_scope',o.scope||''))}" placeholder="mis. Bucket 1 · Bekasi Barat"></div>
+      ${SB()?'<div class="field"><label for="s_pw">'+(e?'Kata sandi baru (opsional)':'Kata sandi awal')+'</label><input id="s_pw" data-k="s_pw" type="password" autocomplete="new-password" value="'+esc(v('s_pw'))+'"></div>':''}</div>
       <div class="err" id="formErr" hidden style="margin-top:8px"></div>
       <div class="formactions" style="margin-top:10px"><button class="btn primary" type="submit">Simpan petugas</button>${e?'<button class="btn" type="button" data-act="staff-edit" data-id="">Batal</button>':''}</div>
-      <p class="note" style="margin:10px 0 0">Petugas baru bisa langsung masuk dengan ID-nya dan kata sandi demo. Field collector masuk ke Front Coll, peran lain ke Desk Call.</p></form>`;
+      <p class="note" style="margin:10px 0 0">${SB()?'Petugas masuk dengan ID dan kata sandi ini. Field collector masuk ke Front Coll, peran lain ke Desk Call. Menghapus petugas menonaktifkan akunnya; riwayat kerjanya tetap tersimpan.':'Petugas baru bisa langsung masuk dengan ID-nya dan kata sandi demo. Field collector masuk ke Front Coll, peran lain ke Desk Call.'}</p></form>`;
 }
 
 /* ---------- actions ---------- */
@@ -852,14 +908,21 @@ async function submitVisit(){
   const patch={last_contact:{at:at,type:'VISIT',result:r},escalated:false};
   if(r==='UNIT_MOVED') patch.unit_status='TRANSFERRED'; else if(!f.v_unit) patch.unit_status='NOT_SEEN'; else if(a.unit_status==='NOT_SEEN') patch.unit_status='WITH_DEBTOR';
   const ok=await save(async()=>{
-    if(r==='PAID'){ act.amount=amount;act.ttr_no=f.v_ttr;
-      await put('ttr',f.v_ttr,{status:'USED',contract_no:a.id,amount:amount,payer:String(f.v_payer||a.name),used_at:at,akh_date:P(),deposit_status:'PENDING'},true);
-      patch.field_paid=(a.field_paid||0)+amount; if(a.active_ptp){await closePtp(a,'KEPT');patch.active_ptp=null} }
-    if(r==='PTP'){ act.ptp_date=f.v_pdate;act.ptp_amount=pam; if(a.active_ptp) await closePtp(a,'BROKEN');
-      await put('ptp',newId('ptp'),{contract_no:a.id,date:f.v_pdate,amount:pam,status:'ACTIVE',source:'VISIT',by:who,created_at:at}); patch.active_ptp={date:f.v_pdate,amount:pam} }
-    if(r==='ADDR_INVALID') await put('skip',newId('skip'),{contract_no:a.id,trigger:'VISIT_ADDR_INVALID',status:'OPEN',note:act.notes,new_contact:'',by:who,created_at:at});
-    await put('activities',newId('act'),act);
-    await put('accounts',a.id,patch,true);
+    if(SB()){
+      await call('ucs_record_visit',{p_contract_no:a.id,p_result:r,p_met_with:act.met_with,p_notes:act.notes,p_unit_seen:act.unit_seen,
+        p_amount:r==='PAID'?amount:null,p_ttr_no:r==='PAID'?f.v_ttr:null,p_payer:r==='PAID'?String(f.v_payer||a.name):null,
+        p_ptp_date:r==='PTP'?f.v_pdate:null,p_ptp_amount:r==='PTP'?pam:null,
+        p_checkin_at:c.at,p_lat:c.lat,p_lng:c.lng,p_accuracy:c.acc,p_distance:c.dist,p_photos:act.photos});
+    }else{
+      if(r==='PAID'){ act.amount=amount;act.ttr_no=f.v_ttr;
+        await put('ttr',f.v_ttr,{status:'USED',contract_no:a.id,amount:amount,payer:String(f.v_payer||a.name),used_at:at,akh_date:P(),deposit_status:'PENDING'},true);
+        patch.field_paid=(a.field_paid||0)+amount; if(a.active_ptp){await closePtp(a,'KEPT');patch.active_ptp=null} }
+      if(r==='PTP'){ act.ptp_date=f.v_pdate;act.ptp_amount=pam; if(a.active_ptp) await closePtp(a,'BROKEN');
+        await put('ptp',newId('ptp'),{contract_no:a.id,date:f.v_pdate,amount:pam,status:'ACTIVE',source:'VISIT',by:who,created_at:at}); patch.active_ptp={date:f.v_pdate,amount:pam} }
+      if(r==='ADDR_INVALID') await put('skip',newId('skip'),{contract_no:a.id,trigger:'VISIT_ADDR_INVALID',status:'OPEN',note:act.notes,new_contact:'',by:who,created_at:at});
+      await put('activities',newId('act'),act);
+      await put('accounts',a.id,patch,true);
+    }
     S.vals={};S.fc.screen=r==='RMP_REQ'?'rmp':null; if(r!=='RMP_REQ'){S.fc.acc=null;S.fc.tab='akh'}
   },'Hasil kunjungan tersimpan.');
   return ok;
@@ -868,10 +931,13 @@ async function submitRmp(who){
   keep();const mobile=S.route==='front-coll',a=acc(mobile?S.fc.acc:S.dc.acc),f=S.vals,t=f.r_type||'TENOR_EXT';
   if(!String(f.r_reason||'').trim()) return fail('Isi alasan penurunan kemampuan bayar.');
   await save(async()=>{
-    await put('rmp',newId('rmp'),{contract_no:a.id,type:t,reason:String(f.r_reason).trim(),status:'DIAJUKAN',channel:mobile?'MOBILE':'TELE',by:who,created_at:nowISO()});
+    if(SB()) await call('ucs_submit_rmp',{p_contract_no:a.id,p_type:t,p_reason:String(f.r_reason).trim()});
+    else await put('rmp',newId('rmp'),{contract_no:a.id,type:t,reason:String(f.r_reason).trim(),status:'DIAJUKAN',channel:mobile?'MOBILE':'TELE',by:who,created_at:nowISO()});
     S.vals={};S.fc.screen='detail';
   },'Pengajuan RMP terkirim.');
 }
+const leastLoadedFc=()=>{const fcs=(meta().staff||[]).filter(s=>s.role==='FC');if(!fcs.length)return null;
+  return fcs.map(s=>[s.id,S.data.accounts.filter(a=>a.collector_id===s.id).length]).sort((x,y)=>x[1]-y[1]||x[0].localeCompare(y[0]))[0][0]};
 async function submitCall(){
   keep();const a=acc(S.dc.acc),f=S.vals,who=S.dc.who,r=f.c_result,at=nowISO(),pam=num(f.c_pamount);
   if(!r) return fail('Pilih hasil call.');
@@ -881,67 +947,113 @@ async function submitCall(){
   const act={contract_no:a.id,type:'CALL',result:r,by:who,at:at,work_date:P(),phone:f.c_phone||a.phone,contacted:f.c_party||'DEBTOR',notes:String(f.c_notes||'').trim()};
   const patch={last_contact:{at:at,type:'CALL',result:r}};
   await save(async()=>{
-    if(r==='PTP'){ act.ptp_date=f.c_pdate;act.ptp_amount=pam; if(a.active_ptp) await closePtp(a,'BROKEN');
-      await put('ptp',newId('ptp'),{contract_no:a.id,date:f.c_pdate,amount:pam,status:'ACTIVE',source:'CALL',by:who,created_at:at}); patch.active_ptp={date:f.c_pdate,amount:pam} }
-    if(r==='BUSY') act.next_action=String(f.c_next).trim();
-    if(r==='INVALID'||r==='UNMATCH'){ patch.phone_status=r;
-      await put('skip',newId('skip'),{contract_no:a.id,trigger:'CALL_'+r,status:'OPEN',note:act.notes||('Nomor '+act.phone+' '+(r==='INVALID'?'tidak valid.':'bukan milik debitur.')),new_contact:'',by:who,created_at:at}) }
-    if(r==='REFUSE') patch.escalated=true;
-    if(r==='RMP') await put('rmp',newId('rmp'),{contract_no:a.id,type:f.r_type||'TENOR_EXT',reason:act.notes||'Permintaan keringanan lewat telepon.',status:'DIAJUKAN',channel:'TELE',by:who,created_at:at});
-    await put('activities',newId('act'),act);
-    await put('accounts',a.id,patch,true);
+    if(SB()){
+      await call('ucs_record_call',{p_contract_no:a.id,p_result:r,p_phone:act.phone,p_contacted:act.contacted,p_notes:act.notes,
+        p_ptp_date:r==='PTP'?f.c_pdate:null,p_ptp_amount:r==='PTP'?pam:null,p_next_action:r==='BUSY'?String(f.c_next).trim():null,p_rmp_type:f.r_type||'TENOR_EXT'});
+    }else{
+      if(r==='PTP'){ act.ptp_date=f.c_pdate;act.ptp_amount=pam; if(a.active_ptp) await closePtp(a,'BROKEN');
+        await put('ptp',newId('ptp'),{contract_no:a.id,date:f.c_pdate,amount:pam,status:'ACTIVE',source:'CALL',by:who,created_at:at}); patch.active_ptp={date:f.c_pdate,amount:pam} }
+      if(r==='BUSY') act.next_action=String(f.c_next).trim();
+      if(r==='INVALID'||r==='UNMATCH'){ if(act.phone===a.phone)patch.phone_status=r;
+        await put('skip',newId('skip'),{contract_no:a.id,trigger:'CALL_'+r,status:'OPEN',note:act.notes||('Nomor '+act.phone+' '+(r==='INVALID'?'tidak valid.':'bukan milik debitur.')),new_contact:'',by:who,created_at:at}) }
+      if(r==='REFUSE'){ patch.escalated=true; if(!a.collector_id) patch.collector_id=leastLoadedFc(); }
+      if(r==='RMP') await put('rmp',newId('rmp'),{contract_no:a.id,type:f.r_type||'TENOR_EXT',reason:act.notes||'Permintaan keringanan lewat telepon.',status:'DIAJUKAN',channel:'TELE',by:who,created_at:at});
+      await put('activities',newId('act'),act);
+      await put('accounts',a.id,patch,true);
+    }
     S.vals={};S.dc.acc=null;S.dc.tab='work';
-  },'Hasil call tersimpan.');
+  },r==='REFUSE'?'Hasil call tersimpan. Account dieskalasi ke petugas lapangan.':'Hasil call tersimpan.');
 }
 async function submitSkip(id){
-  keep();const c=S.data.skip.find(x=>x.id===id),a=acc(c.contract_no),k='sk_'+id,val=String(S.vals[k+'_v']||'').trim(),type=S.vals[k+'_t']||'PHONE';
+  keep();const c=S.data.skip.find(x=>x.id===id),a=acc(c.contract_no),k='sk_'+id,val=String(S.vals[k+'_v']||'').trim(),type=S.vals[k+'_t']||'PHONE',src=String(S.vals[k+'_s']||'skip tracing').trim();
   if(!val){toast('Isi nomor atau alamat baru terlebih dahulu.');return}
   await save(async()=>{
-    await put('skip',id,{status:'FOUND',new_contact:val,closed_at:nowISO(),closed_by:S.dc.who},true);
-    if(a){const patch={extra_contacts:(a.extra_contacts||[]).concat([{type:type,value:val,source:String(S.vals[k+'_s']||'skip tracing').trim()}])};if(type==='PHONE')patch.phone_status='VALID';await put('accounts',a.id,patch,true)}
+    if(SB()) await call('ucs_resolve_skip',{p_id:id,p_found:true,p_type:type,p_value:val,p_source:src});
+    else{
+      await put('skip',id,{status:'FOUND',new_contact:val,closed_at:nowISO(),closed_by:S.dc.who},true);
+      if(a){const patch={extra_contacts:(a.extra_contacts||[]).concat([{type:type,value:val,source:src}])};if(type==='PHONE')patch.phone_status='VALID';await put('accounts',a.id,patch,true)}
+    }
     delete S.vals[k+'_v'];delete S.vals[k+'_s'];
   },'Data baru tersimpan dan terbaca petugas lapangan.');
 }
-function submitLogin(){
-  keep();const fc=S.route==='front-coll',id=String(S.vals.l_id||'').trim().toUpperCase(),u=(meta().staff||[]).find(s=>s.id===id&&(fc?s.role==='FC':s.role!=='FC'));
-  if(!u||S.vals.l_pw!==DEMO_PW) return fail('ID petugas atau kata sandi salah.');
+async function submitLogin(){
+  keep();const fc=S.route==='front-coll',id=String(S.vals.l_id||'').trim().toUpperCase(),pw=String(S.vals.l_pw||'');
+  if(!id||!pw) return fail('Isi ID petugas dan kata sandi.');
+  if(SB()){
+    if(busy)return;busy=true;const btn=$('#l_btn');if(btn){btn.disabled=true;btn.textContent='Memeriksa…'}
+    try{
+      const info=await call('ucs_staff_login',{p_id:id});
+      if(!info) return fail('ID petugas atau kata sandi salah.');
+      if(fc?info.role!=='FC':info.role==='FC') return fail(fc?'Akun ini bukan field collector. Masuk lewat Desk Call.':'Akun field collector masuk lewat Front Coll.');
+      const {error}=await sb.auth.signInWithPassword({email:info.email,password:pw});
+      if(error) return fail(/invalid/i.test(error.message)?'ID petugas atau kata sandi salah.':'Gagal masuk: '+error.message);
+      if(!await sbAfterSignIn()) return fail('Akun ini belum terdaftar sebagai petugas aktif.');
+      S.vals={};busy=false;render();toast('Masuk sebagai '+S.me.name+'.');
+    }catch(e){fail('Tidak bisa terhubung ke server. Periksa koneksi lalu coba lagi.')}
+    finally{busy=false;const b=$('#l_btn');if(b){b.disabled=false;b.textContent='Masuk'}}
+    return;
+  }
+  const u=(meta().staff||[]).find(s=>s.id===id&&(fc?s.role==='FC':s.role!=='FC'));
+  if(!u||pw!==DEMO_PW) return fail('ID petugas atau kata sandi salah.');
   S[fc?'fc':'dc'].who=id;saveWho();S.vals={};render();toast('Masuk sebagai '+u.name+'.');
 }
 async function submitContact(){
-  keep();const fc=S.route==='front-coll',a=acc(fc?S.fc.acc:S.dc.acc),val=String(S.vals.k_value||'').trim();
+  keep();const fc=S.route==='front-coll',a=acc(fc?S.fc.acc:S.dc.acc),val=String(S.vals.k_value||'').trim(),type=S.vals.k_type||'PHONE',src=String(S.vals.k_source||(fc?'kunjungan':'desk call')).trim();
   if(!a||!val){toast('Isi nomor atau alamat baru terlebih dahulu.');return}
-  await save(async()=>{await put('accounts',a.id,{extra_contacts:(a.extra_contacts||[]).concat([{type:S.vals.k_type||'PHONE',value:val,source:String(S.vals.k_source||(fc?'kunjungan':'desk call')).trim()}])},true);delete S.vals.k_value;delete S.vals.k_source},'Kontak baru tersimpan.');
+  await save(async()=>{
+    if(SB()) await call('ucs_add_contact',{p_contract_no:a.id,p_type:type,p_value:val,p_source:src});
+    else await put('accounts',a.id,{extra_contacts:(a.extra_contacts||[]).concat([{type:type,value:val,source:src}])},true);
+    delete S.vals.k_value;delete S.vals.k_source},'Kontak baru tersimpan.');
 }
 async function submitAccount(){
   keep();const f=S.vals,old=S.dc.edit!=='new'?acc(S.dc.edit):null,t=k=>String(f[k]||'').trim(),inst=num(f.a_inst),tenor=num(f.a_tenor)||36,instno=num(f.a_instno)||1,due=t('a_due');
   if(!t('a_name')||!t('a_phone')||!t('a_address')||!t('a_unit')) return fail('Nama, telepon, alamat dan unit wajib diisi.');
   if(inst<=0) return fail('Isi angsuran per bulan.');
   if(!/^\d{4}-\d{2}-\d{2}$/.test(due)) return fail('Isi tanggal jatuh tempo tertua.');
-  const d=derive(due,inst),FCM={FIELD:'FC01',REMEDIAL:'FC02',END_BUCKET:'FC03'},def=FCM[d.stage]&&(meta().staff||[]).some(s=>s.id===FCM[d.stage])?FCM[d.stage]:null;
-  const product=f.a_product||'2W',body=Object.assign({name:t('a_name'),phone:t('a_phone'),job:t('a_job'),address:t('a_address'),area:t('a_area'),zipcode:t('a_zip'),product:product,unit:t('a_unit'),plate:t('a_plate').toUpperCase(),year:num(f.a_year),tenor:tenor,inst_no:instno,installment:inst,segment:f.a_seg||'MEDIUM',mob:num(f.a_mob)||1,
-    emergency:{name:t('a_ename'),relation:t('a_erel'),phone:t('a_ephone')},os_principal:Math.round(inst*Math.max(0,tenor-instno)*.82),collector_id:old&&old.stage===d.stage?old.collector_id:def},d);
+  const d=derive(due,inst),product=f.a_product||'2W';
+  const body=Object.assign({name:t('a_name'),phone:t('a_phone'),job:t('a_job'),address:t('a_address'),area:t('a_area'),zipcode:t('a_zip'),product:product,unit:t('a_unit'),plate:t('a_plate').toUpperCase(),year:num(f.a_year),tenor:tenor,inst_no:instno,installment:inst,segment:f.a_seg||'MEDIUM',mob:num(f.a_mob)||1,
+    emergency:{name:t('a_ename'),relation:t('a_erel'),phone:t('a_ephone')},os_principal:Math.round(inst*Math.max(0,tenor-instno)*.82),collector_id:old&&old.stage===d.stage?old.collector_id:null},d);
   await save(async()=>{
-    if(old) await put('accounts',old.id,body,true);
+    if(SB()){
+      const p={name:body.name,phone:body.phone,job:body.job,address:body.address,area:body.area,zipcode:body.zipcode,product:product,unit:body.unit,plate:body.plate,
+        year:body.year||null,tenor:tenor,inst_no:instno,installment:inst,oldest_due:due,segment:body.segment,mob:body.mob,emergency:body.emergency};
+      await call('ucs_save_account',{p_contract_no:old?old.id:null,p:p});
+    }else if(old) await put('accounts',old.id,body,true);
     else{let id;do{id='SMF-'+product+'-'+String(30000+Math.floor(Math.random()*60000))}while(acc(id));
       await put('accounts',id,Object.assign(body,{phone_status:'VALID',unit_status:'WITH_DEBTOR',max_dpd_12m:d.dpd,sp_level:0,rmp_flag:false,extra_contacts:[],last_contact:null,active_ptp:null,field_paid:0,escalated:false}))}
     S.vals={};S.dc.edit=null;
-  },old?'Data account diperbarui.':'Account baru tersimpan.');
+  },old?'Data account diperbarui.':'Account baru tersimpan. Tugaskan petugas lapangan di menu Penugasan bila perlu.');
 }
 async function submitTtr(){
   keep();const fc=S.vals.t_fc,start=num(S.vals.t_start),n=Math.min(20,num(S.vals.t_count)),ids=[];
   if(!fc||start<=0||n<=0) return fail('Isi petugas, nomor awal dan jumlah lembar (maksimal 20).');
   for(let i=0;i<n;i++){const id='TTR-'+String(start+i).padStart(7,'0');if(!S.data.ttr.some(x=>x.id===id))ids.push(id)}
   if(!ids.length) return fail('Semua nomor pada rentang itu sudah terdaftar.');
-  await save(async()=>{for(const id of ids) await put('ttr',id,{status:'ISSUED',issued_to:fc,issued_at:nowISO(),contract_no:'',amount:0,payer:'',deposit_status:'',used_at:'',akh_date:''});S.vals={}},ids.length+' lembar TTR diserahkan ke '+staff(fc).name+'.');
+  await save(async()=>{
+    if(SB()) await call('ucs_issue_ttr',{p_fc:fc,p_start:start,p_count:n});
+    else for(const id of ids) await put('ttr',id,{status:'ISSUED',issued_to:fc,issued_at:nowISO(),contract_no:'',amount:0,payer:'',deposit_status:'',used_at:'',akh_date:''});
+    S.vals={}},ids.length+' lembar TTR diserahkan ke '+staff(fc).name+'.');
 }
 async function submitStaff(){
-  keep();const L=(meta().staff||[]).slice(),e=S.dc.sedit,id=String(S.vals.s_id||'').trim().toUpperCase(),name=String(S.vals.s_name||'').trim();
+  keep();const L=(meta().staff||[]).slice(),e=S.dc.sedit,id=String(S.vals.s_id||'').trim().toUpperCase(),name=String(S.vals.s_name||'').trim(),pw=String(S.vals.s_pw||'');
   if(!/^[A-Z0-9]{3,8}$/.test(id)) return fail('ID petugas 3 sampai 8 huruf atau angka, tanpa spasi.');
   if(!name) return fail('Isi nama petugas.');
   const i=L.findIndex(s=>s.id===id);if(!e&&i>=0) return fail('ID '+id+' sudah dipakai.');
+  if(SB()&&!e&&pw.length<6) return fail('Isi kata sandi awal minimal 6 karakter.');
+  if(SB()&&pw&&pw.length<6) return fail('Kata sandi minimal 6 karakter.');
   const row={id:id,name:name,role:S.vals.s_role||'FC',scope:String(S.vals.s_scope||'').trim()};if(i>=0)L[i]=row;else L.push(row);
-  await save(async()=>{await put('meta','config',{staff:L},true);S.vals={};S.dc.sedit=null},'Data petugas tersimpan.');
+  await save(async()=>{
+    if(SB()) await call('ucs_save_staff',{p_id:id,p_name:name,p_role:row.role,p_scope:row.scope,p_password:pw||null,p_is_new:!e});
+    else await put('meta','config',{staff:L},true);
+    S.vals={};S.dc.sedit=null},'Data petugas tersimpan.');
 }
+function localBatch(){
+  const d=localISO(new Date());meta().process_date=d;
+  S.data.accounts.forEach(a=>{Object.assign(a,derive(a.oldest_due,a.installment));a.max_dpd_12m=Math.max(a.max_dpd_12m||0,a.dpd);
+    if((a.stage==='REMINDER'||a.stage==='TELE')&&!a.escalated)a.collector_id=undefined});
+  S.data.ptp.forEach(p=>{if(p.status==='ACTIVE'&&p.date<d){p.status='BROKEN';const a=acc(p.contract_no);if(a)a.active_ptp=null}});
+}
+const W=(remote,local)=>SB()?remote():local();
 const ACT={
   'fc-tab':d=>go('fc',{tab:d.tab,screen:null,acc:null}),
   'fc-open':d=>go('fc',{acc:d.id,screen:'detail'}),
@@ -949,27 +1061,30 @@ const ACT={
   'fc-screen':d=>go('fc',{screen:d.screen}),
   'fc-checkin':()=>go('fc',{screen:'visit',checkin:dummyFix(acc(S.fc.acc))}),
   'fc-regps':()=>go('fc',{checkin:dummyFix(acc(S.fc.acc))},false),
-  'logout':()=>{const k=S.route==='front-coll'?'fc':'dc';S[k].who=null;saveWho();go(k,k==='fc'?{tab:'home',screen:null,acc:null}:{tab:'dash',acc:null,edit:null,sedit:null})},
+  'logout':async()=>{const k=S.route==='front-coll'?'fc':'dc';
+    if(SB()){try{await sb.auth.signOut()}catch(e){}sbClear()}else{S[k].who=null;saveWho()}
+    go(k,k==='fc'?{tab:'home',screen:null,acc:null}:{tab:'dash',acc:null,edit:null,sedit:null})},
   'acc-edit':d=>go('dc',{tab:'accs',acc:null,edit:d.id}),
   'acc-cancel':()=>go('dc',{edit:null}),
   'staff-edit':d=>go('dc',{sedit:d.id||null}),
-  'staff-del':d=>save(()=>put('meta','config',{staff:(meta().staff||[]).filter(s=>s.id!==d.id)},true),'Petugas dihapus.'),
-  'ttr-void':d=>save(()=>put('ttr',d.id,{status:'VOID'},true),'TTR dibatalkan.'),
-  'rmp-set':d=>save(async()=>{const r=S.data.rmp.find(x=>x.id===d.id);await put('rmp',d.id,{status:d.s,decided_by:S.dc.who,decided_at:nowISO()},true);if(d.s==='DISETUJUI'&&r&&acc(r.contract_no))await put('accounts',r.contract_no,{rmp_flag:true},true)},d.s==='DISETUJUI'?'Pengajuan RMP disetujui.':'Pengajuan RMP ditolak.'),
-  'fc-deposit':()=>save(async()=>{const L=myTTR().filter(t=>t.status==='USED'&&t.deposit_status==='PENDING');for(const t of L) await put('ttr',t.id,{deposit_status:'MATCHED',deposit_at:nowISO()},true)},'Setoran dicatat. Kasir mencocokkan TTR dengan uang yang diterima.'),
+  'staff-del':d=>save(()=>W(()=>call('ucs_delete_staff',{p_id:d.id}),()=>put('meta','config',{staff:(meta().staff||[]).filter(s=>s.id!==d.id)},true)),SB()?'Petugas dinonaktifkan. Account-nya dilepas dari penugasan.':'Petugas dihapus.'),
+  'ttr-void':d=>save(()=>W(()=>call('ucs_void_ttr',{p_ttr_no:d.id}),()=>put('ttr',d.id,{status:'VOID'},true)),'TTR dibatalkan.'),
+  'rmp-set':d=>save(()=>W(()=>call('ucs_decide_rmp',{p_id:d.id,p_status:d.s}),async()=>{const r=S.data.rmp.find(x=>x.id===d.id);await put('rmp',d.id,{status:d.s,decided_by:S.dc.who,decided_at:nowISO()},true);if(d.s==='DISETUJUI'&&r&&acc(r.contract_no))await put('accounts',r.contract_no,{rmp_flag:true},true)}),d.s==='DISETUJUI'?'Pengajuan RMP disetujui.':'Pengajuan RMP ditolak.'),
+  'fc-deposit':()=>save(()=>W(()=>call('ucs_deposit_ttr'),async()=>{const L=myTTR().filter(t=>t.status==='USED'&&t.deposit_status==='PENDING');for(const t of L) await put('ttr',t.id,{deposit_status:'MATCHED',deposit_at:nowISO()},true)}),'Setoran dicatat. Kasir mencocokkan TTR dengan uang yang diterima.'),
   'dc-tab':d=>go('dc',{tab:d.tab,acc:null,edit:null,sedit:null}),
   'dc-open':d=>go('dc',{acc:d.id}),
   'dc-close':()=>go('dc',{acc:null}),
   'dc-queue':d=>go('dc',{queue:d.q},false),
-  'ptp-set':d=>save(async()=>{const p=S.data.ptp.find(x=>x.id===d.id);await put('ptp',d.id,{status:d.s},true);const a=acc(p.contract_no);if(a&&a.active_ptp)await put('accounts',a.id,{active_ptp:null},true)},d.s==='KEPT'?'Janji bayar ditandai ditepati.':'Janji bayar ditandai ingkar.'),
-  'skip-none':d=>save(()=>put('skip',d.id,{status:'NOT_FOUND',closed_at:nowISO(),closed_by:S.dc.who},true),'Kasus ditutup tanpa hasil.'),
-  'sp-issue':d=>save(async()=>{const a=acc(d.id),n=a.sp_level+1;await put('activities',newId('act'),{contract_no:a.id,type:'SP',result:'SP '+n,by:S.dc.who,at:nowISO(),work_date:P(),notes:'Surat peringatan '+n+' diterbitkan untuk dikirim ke alamat debitur.'});await put('accounts',a.id,{sp_level:n},true)},'Surat peringatan diterbitkan.')
+  'ptp-set':d=>save(()=>W(()=>call('ucs_set_ptp_status',{p_id:d.id,p_status:d.s}),async()=>{const p=S.data.ptp.find(x=>x.id===d.id);await put('ptp',d.id,{status:d.s},true);const a=acc(p.contract_no);if(a&&a.active_ptp)await put('accounts',a.id,{active_ptp:null},true)}),d.s==='KEPT'?'Janji bayar ditandai ditepati.':'Janji bayar ditandai ingkar.'),
+  'skip-none':d=>save(()=>W(()=>call('ucs_resolve_skip',{p_id:d.id,p_found:false}),()=>put('skip',d.id,{status:'NOT_FOUND',closed_at:nowISO(),closed_by:S.dc.who},true)),'Kasus ditutup tanpa hasil.'),
+  'sp-issue':d=>save(()=>W(()=>call('ucs_issue_sp',{p_contract_no:d.id}),async()=>{const a=acc(d.id),n=a.sp_level+1;await put('activities',newId('act'),{contract_no:a.id,type:'SP',result:'SP '+n,by:S.dc.who,at:nowISO(),work_date:P(),notes:'Surat peringatan '+n+' diterbitkan untuk dikirim ke alamat debitur.'});await put('accounts',a.id,{sp_level:n},true)}),'Surat peringatan diterbitkan.'),
+  'run-batch':()=>save(()=>W(()=>call('ucs_refresh_positions',{}),async()=>localBatch()),'Batch harian selesai. Posisi semua account dihitung ulang.')
 };
 document.addEventListener('click',e=>{const el=e.target.closest('[data-act]');if(el&&ACT[el.dataset.act]){if(el.tagName!=='A')e.preventDefault();ACT[el.dataset.act](el.dataset)}});
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&e.target.matches&&e.target.matches('tr.row'))e.target.click()});
 document.addEventListener('submit',e=>{const f=e.target.closest('[data-form]');if(!f)return;e.preventDefault();const k=f.dataset.form;if(k==='visit')submitVisit();else if(k==='rmp')submitRmp(f.dataset.who);else if(k==='call')submitCall();else if(k==='skip')submitSkip(f.dataset.id);else if(k==='login')submitLogin();else if(k==='contact')submitContact();else if(k==='account')submitAccount();else if(k==='ttr-issue')submitTtr();else if(k==='staff')submitStaff()});
 document.addEventListener('change',e=>{const t=e.target;if(t.dataset.rerender){pending=false;render()}
-  else if(t.dataset.change==='assign'){const id=t.dataset.id,val=t.value||null;save(()=>put('accounts',id,{collector_id:val},true),val?'Account ditugaskan ke '+staff(val).name+'.':'Penugasan dilepas.')}
+  else if(t.dataset.change==='assign'){const id=t.dataset.id,val=t.value||null;save(()=>W(()=>call('ucs_assign_collector',{p_contract_no:id,p_collector_id:val}),()=>put('accounts',id,{collector_id:val},true)),val?'Account ditugaskan ke '+staff(val).name+'.':'Penugasan dilepas.')}
   else if(t.dataset.change==='dc-bucket'){S.dc.bucket=t.value;render()}});
 let qT;document.addEventListener('input',e=>{const k=e.target.dataset.input;if(!k)return;const p=k.split('.'),id=e.target.id;S[p[0]][p[1]]=e.target.value;clearTimeout(qT);qT=setTimeout(()=>{const pos=e.target.selectionStart;render();const n=document.getElementById(id);if(n){n.focus();try{n.setSelectionRange(pos,pos)}catch(x){}}},250)});
 
